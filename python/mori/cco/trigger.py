@@ -139,9 +139,9 @@ class TriggerQueue(CCOResource):
 class TriggerBatch:
     """Chains over several :class:`TriggerQueue` objects, built once and armed in one call.
 
-    Each :meth:`arm` drains every queue, appends every chain with its target from
-    ``targets[slot]`` and kicks all queues behind one HDP flush. At most two copies per
-    chain, ``>=`` compares only. The queues must outlive the batch.
+    Each :meth:`arm` drains every queue (unless ``drain=False``), appends every chain with
+    its target from ``targets[slot]`` and kicks all queues behind one HDP flush. At most two
+    copies per chain, ``>=`` compares only. The queues must outlive the batch.
     """
 
     OK = _cco.TRIGGER_BATCH_OK
@@ -163,8 +163,11 @@ class TriggerBatch:
     def __len__(self) -> int:
         return len(self._b)
 
-    def arm(self, targets, timeout_s: float = 30.0) -> int:
-        """Returns :attr:`OK`, or :attr:`NO_ROOM` / :attr:`DRAIN_TIMEOUT` with nothing appended."""
+    def arm(self, targets, timeout_s: float = 30.0, drain: bool = True) -> int:
+        """Returns :attr:`OK`, or :attr:`NO_ROOM` / :attr:`DRAIN_TIMEOUT` with nothing appended.
+
+        ``drain=False`` appends behind work still queued, if the rings have room.
+        """
         for q in self._queues:
             q._check_valid()
-        return self._b.arm(targets, int(timeout_s * 1e9))
+        return self._b.arm(targets, int(timeout_s * 1e9), drain)

@@ -179,12 +179,73 @@ def _worker(rank, world_size, uid_path, results_path):
         f.write(err or "")
 
 
-def _spawn_entry(rank, world_size, uid_path, results_path):
-    _worker(rank, world_size, uid_path, results_path)
+def _drain_worker(rank, world_size, uid_path, results_path):
+    err = None
+    try:
+        import numpy as np
+
+        from mori.cco import (
+            Communicator,
+            TriggerBatch,
+            TriggerQueue,
+            UniqueId,
+            peer_ptr,
+        )
+
+        from .helper import fill, read, zero
+
+        u64 = ctypes.c_uint64
+        torch.cuda.set_device(rank)
+        with open(uid_path, "rb") as f:
+            uid = UniqueId.from_bytes(f.read())
+        comm = Communicator.init(world_size, rank, uid, per_rank_vmm=128 * 1024 * 1024)
+        mem = comm.alloc_mem(DATA_OFF + 2 * NBYTES)
+        win = comm.register_window(mem.ptr, mem.size)
+        base = win.local_ptr
+        zero(base, DATA_OFF + 2 * NBYTES)
+        peer = 1 - rank
+        q = TriggerQueue(comm, peer, ring_bytes=4096)
+        batch = TriggerBatch()
+        dst = peer_ptr(comm, base + DATA_OFF + NBYTES, peer)
+        # 20 chains of 96 ring bytes: two batches fit the 4 KiB ring, three do not.
+        for _ in range(20):
+            batch.add(
+                q,
+                base + GATE_OFF,
+                0,
+                [(base + DATA_OFF, dst, NBYTES)],
+                base + ARRIVE_OFF,
+            )
+        comm.barrier()
+
+        targets = np.array([1], dtype=np.uint64)
+        _, w0 = q.state()
+        assert batch.arm(targets) == TriggerBatch.OK
+        size = q.state()[1] - w0
+        targets[0] = 2
+        assert batch.arm(targets, drain=False) == TriggerBatch.OK
+        assert q.state()[1] == w0 + 2 * size
+        assert batch.arm(targets, drain=False) == TriggerBatch.NO_ROOM
+        assert q.state()[1] == w0 + 2 * size
+        time.sleep(0.005)
+        assert read(base + ARRIVE_OFF, 1, u64)[0] == 0
+        fill(base + GATE_OFF, [2], u64)
+        assert q.quiesce(timeout_s=10.0)
+        assert read(base + ARRIVE_OFF, 1, u64)[0] == 40
+        comm.barrier()
+        assert q.close()
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 8])
-def test_trigger_queue_bindings(world_size):
+def _spawn_entry(rank, worker, world_size, uid_path, results_path):
+    worker(rank, world_size, uid_path, results_path)
+
+
+def _run(worker, world_size):
     _require_gpus(world_size)
     from mori.cco import Communicator
 
@@ -197,7 +258,7 @@ def test_trigger_queue_bindings(world_size):
         f.write(bytes(Communicator.get_unique_id()))
     torch.multiprocessing.spawn(
         _spawn_entry,
-        args=(world_size, uid_path, results_path),
+        args=(worker, world_size, uid_path, results_path),
         nprocs=world_size,
         join=True,
     )
@@ -208,3 +269,12 @@ def test_trigger_queue_bindings(world_size):
         if e:
             errs.append(f"rank {rank}:\n{e}")
     assert not errs, "\n\n".join(errs)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_trigger_queue_bindings(world_size):
+    _run(_worker, world_size)
+
+
+def test_trigger_batch_arm_without_drain():
+    _run(_drain_worker, 2)

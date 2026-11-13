@@ -1035,7 +1035,7 @@ constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
 //
 // One host thread per queue. Calls return 0 on success and -1 on error;
 // ccoTriggerAppendChain returns 1 when the ring is full and ccoTriggerQuiesce returns
-// 1 on timeout. Kick only a queue that is drained or parked on a closed gate.
+// 1 on timeout. A kick may land while the engine still runs earlier chains.
 typedef struct ccoTriggerQueue* ccoTriggerQueue_t;
 
 struct ccoTriggerCopy {

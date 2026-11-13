@@ -664,7 +664,8 @@ cdef class _TriggerBatch:
     def __len__(self):
         return self._n
 
-    def arm(self, const uint64_t[::1] targets, uint64_t timeout_ns=30_000_000_000):
+    def arm(self, const uint64_t[::1] targets, uint64_t timeout_ns=30_000_000_000,
+            bint drain=True):
         cdef int i, ret = 0
         cdef uint64_t r, w, t
         cdef Py_ssize_t ntargets = targets.shape[0]
@@ -679,7 +680,7 @@ cdef class _TriggerBatch:
                 raise ValueError(f"chain {i}: target does not fit the engine's 32-bit compare")
         with nogil:
             for i in range(self._nq):
-                if ccoTriggerQuiesce(self._qs[i], 0xFFFFFFFFFFFFFFFF, timeout_ns) != 0:
+                if drain and ccoTriggerQuiesce(self._qs[i], 0xFFFFFFFFFFFFFFFF, timeout_ns) != 0:
                     ret = _BATCH_DRAIN_TIMEOUT
                     break
                 ccoTriggerQueueState(self._qs[i], &r, &w)
