@@ -31,6 +31,10 @@ N = 7168  # features
 NAN_BF16 = float("nan")
 
 
+def _is_gfx942() -> bool:
+    return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx942")
+
+
 def _require_gpus(world_size: int) -> None:
     n = torch.cuda.device_count()
     if n < world_size:
@@ -134,7 +138,9 @@ class _Harness:
         self.comm.destroy()
 
 
-def _case_exact(h, ms, calls_per_m):
+def _case_exact(h, ms, calls_per_m, unit_bands=None):
+    if unit_bands is not None:
+        assert h.op.unit_bands == unit_bands
     bad = []
     for m in ms:
         for _ in range(calls_per_m):
@@ -206,6 +212,15 @@ def _case_misuse(h, m):
                 producer=GateProducerSpec(mt0=h.mt0, mt1=h.mt1),
                 **bad,
             )
+    spec = GateProducerSpec(mt0=h.mt0, mt1=h.mt1)
+    for bad, why in (
+        (dict(contiguous=False, unit_bands=2), "contiguous"),
+        (dict(unit_bands=3), "unit_bands"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            GemmTriggeredAllReduceOp(h.comm, n=N, m_max=m, producer=spec, **bad)
+    with pytest.raises(ValueError, match="divides by"):
+        op.input_view(h.mt1 * h.ws)  # unit_bands=2: one band per rank is too few
     with pytest.raises(RuntimeError, match="armed"):
         op.complete(m)
     with pytest.raises(RuntimeError, match="armed"):
@@ -306,29 +321,49 @@ def _run(world_size, case, setup, args):
 MODES = ["after", "concurrent"]
 
 
+def _unit_bands(m_max, mt1, world_size, contiguous):
+    per = m_max // mt1 // world_size
+    return (
+        next(u for u in range(1, per + 1) if per % u == 0 and per // u <= 8)
+        if contiguous
+        else 1
+    )
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
 @pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("mt0,mt1", [(96, 128), (256, 256)])
-def test_exact(world_size, mt0, mt1, reduce_mode):
-    step = mt1 * world_size
+def test_exact(world_size, mt0, mt1, reduce_mode, contiguous):
+    ub = _unit_bands(8192, mt1, world_size, contiguous)
+    step = mt1 * world_size * ub
     ms = sorted({step, 2048 // step * step or step, 8192})
     _run(
         world_size,
         "exact",
-        dict(mt0=mt0, mt1=mt1, m_max=8192, reduce_mode=reduce_mode),
-        dict(ms=ms, calls_per_m=3),
+        dict(
+            mt0=mt0, mt1=mt1, m_max=8192, reduce_mode=reduce_mode, contiguous=contiguous
+        ),
+        dict(ms=ms, calls_per_m=3, unit_bands=ub),
     )
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
 @pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("world_size", [2, 8])
-def test_varying_m(world_size, reduce_mode):
-    step = 128 * world_size
+def test_varying_m(world_size, reduce_mode, contiguous):
+    step = 128 * world_size * _unit_bands(8192, 128, world_size, contiguous)
     ms = [step * 2, step * 8, step, step * 4, step * 8, step]
     _run(
         world_size,
         "exact",
-        dict(mt0=96, mt1=128, m_max=step * 8, reduce_mode=reduce_mode),
+        dict(
+            mt0=96,
+            mt1=128,
+            m_max=step * 8,
+            reduce_mode=reduce_mode,
+            contiguous=contiguous,
+        ),
         dict(ms=ms, calls_per_m=1),
     )
 
@@ -352,6 +387,8 @@ def test_concurrent_reducer_sizes(reducer_blocks):
 @pytest.mark.parametrize("reduce_mode", MODES)
 @pytest.mark.parametrize("ag_engine_offset", [None, 1])
 def test_queue_placement(ag_engine_offset, reduce_mode):
+    if ag_engine_offset and not _is_gfx942():
+        pytest.skip("engine offsets are gfx942-only")
     _run(
         8,
         "exact",
@@ -433,7 +470,7 @@ def test_misuse(reduce_mode):
     _run(
         2,
         "misuse",
-        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode),
+        dict(mt0=96, mt1=128, m_max=2048, reduce_mode=reduce_mode, unit_bands=2),
         dict(m=2048),
     )
 

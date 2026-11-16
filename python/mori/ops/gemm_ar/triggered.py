@@ -24,20 +24,23 @@
 The GEMM's epilogue only releases gates; copy engines move every byte, on chains the
 host armed before the GEMM was launched::
 
-    host    arm:  per peer d, for each band b that d owns
-                    [POLL rs_gate[b]] [COPY my rows of b -> d's recv slot] [ATOMIC d's rs_arrive]
-                  then for each band b that I own
-                    [POLL ag_gate[b]] [COPY my reduced b -> d's output] [ATOMIC d's ag_arrive]
+    host    arm:  per peer d, for each unit u that d owns
+                    [POLL rs_gate[u]] [COPY my rows of u -> d's recv slot] [ATOMIC d's rs_arrive]
+                  then my reduced rows, in one copy (contiguous) or one per unit:
+                    [POLL ag_gate] [COPY -> d's output] [ATOMIC d's ag_arrive]
                   then [POLL last ag_gate] [ATOMIC my sent[d]]
-    GEMM    each work-group stores its tile and adds 1 to its band's rs_gate
-    reduce  per band I own, in order: wait for my tiles and every peer's copy, sum,
+    GEMM    each work-group stores its tile and adds 1 to its unit's rs_gate
+    reduce  per unit I own, in order: wait for my tiles and every peer's copy, sum,
             store, add to ag_gate
-    wait    until every peer's reduced bands have landed in my output and my
+    wait    until every peer's reduced units have landed in my output and my
             all-gather has finished reading mine
 
-Band ``b`` (``mt1`` rows) belongs to rank ``b % W``, so every link starts early. The
-GEMM is the caller's: it writes the partial ``[m, n]`` (bf16, row-major) into
-:meth:`GemmTriggeredAllReduceOp.input_view` and releases each band through
+A unit is ``unit_bands`` bands of ``mt1`` rows. By default (``contiguous=True``) rank
+``r`` owns the ``r``-th slice of rows; a GEMM walking its tiles destination-rotated
+starts every link early. ``contiguous=False`` gives band ``b`` to rank ``b % W``, which
+does so in any tile order. The GEMM is the caller's: it writes the partial ``[m, n]``
+(bf16, row-major) into :meth:`GemmTriggeredAllReduceOp.input_view` and releases each
+band through
 :attr:`~GemmTriggeredAllReduceOp.gate_view` (``GateTileBase = 0``)::
 
     op.arm(m)                                               # host: this call's chains
@@ -78,6 +81,9 @@ _UNIT_BYTES = 32  # ring bytes per SDMA packet
 _CHAIN_BYTES = 3 * _UNIT_BYTES  # POLL, COPY, ATOMIC
 _MARK_BYTES = 2 * _UNIT_BYTES  # POLL, ATOMIC
 _DEFAULT_RING_BYTES = 256 << 10
+# Reduce-scatter chains per peer that unit_bands=None aims for: each costs a fixed
+# ~7-8 us of copy-engine time on MI355X.
+_MAX_UNITS_PER_PEER = 8
 
 
 def _align(x: int) -> int:
@@ -108,6 +114,7 @@ class TriggeredArLayout:
             ("ag_arrive_off", ws * kmax * gs),
             ("sent_off", ws * gs),
             ("calls_off", self.max_bands * 4),
+            ("kcalls_off", self.max_bands_per_rank * 4),
             ("sent_calls_off", gs),
             ("err_off", gs),
             ("input_off", self.max_bands * self.band_bytes),
@@ -136,7 +143,9 @@ class GemmTriggeredAllReduceOp:
     """GEMM + two-shot all-reduce (reduce-scatter and all-gather on copy engines).
 
     One instance serves one feature count ``n`` and any token count ``m <= m_max``
-    with ``m / producer.mt1`` bands divisible by the world size. bf16 only.
+    with ``m / producer.mt1`` bands divisible by ``world_size * unit_bands``. bf16 only.
+    ``unit_bands=None`` picks the smallest unit that leaves at most 8 per peer at
+    ``m_max``.
     ``reducer_blocks`` work-groups reduce the bands in order, after the GEMM or
     beside it (``reduce_mode``). ``ag_engine_offset``
     ``None`` (default) chains the all-gather behind the reduce-scatter on the link's
@@ -160,6 +169,8 @@ class GemmTriggeredAllReduceOp:
         ring_bytes: int = 0,
         wait_polls: int = 1 << 24,
         quiesce_timeout_s: float = 30.0,
+        contiguous: bool = True,
+        unit_bands: int | None = None,
     ):
         self._closed = True
         self._queues: list[TriggerQueue] = []
@@ -173,6 +184,21 @@ class GemmTriggeredAllReduceOp:
             )
         if (n * _ELEM_BYTES) % 16:
             raise ValueError(f"n={n}: rows must be whole 16-byte packs")
+        per = bands // ws
+        if not contiguous:
+            if unit_bands not in (None, 1):
+                raise ValueError("unit_bands needs contiguous=True")
+            unit_bands = 1
+        elif unit_bands is None:
+            unit_bands = next(
+                u
+                for u in range(1, per + 1)
+                if per % u == 0 and per // u <= _MAX_UNITS_PER_PEER
+            )
+        elif unit_bands < 1 or per % unit_bands:
+            raise ValueError(
+                f"unit_bands={unit_bands} must divide the {per} bands per rank at m_max"
+            )
         if reducer_blocks < 1:
             raise ValueError("reducer_blocks must be >= 1")
         if reduce_mode not in ("after", "concurrent"):
@@ -201,6 +227,7 @@ class GemmTriggeredAllReduceOp:
         self.n, self.producer = n, producer
         self.reducer_blocks, self.wait_polls = reducer_blocks, wait_polls
         self.reduce_mode = reduce_mode
+        self.contiguous, self.unit_bands = contiguous, unit_bands
         self.quiesce_timeout_s = quiesce_timeout_s
         self.rebase_at = self.REBASE_AT  # lowered by tests to force a re-base
         self.layout = TriggeredArLayout(
@@ -247,7 +274,7 @@ class GemmTriggeredAllReduceOp:
             )
             self._view = gate_view(
                 self.base,
-                [self.rs_gates.addr(b) for b in range(lay.max_bands)],
+                [self.rs_gates.addr(b // unit_bands) for b in range(lay.max_bands)],
                 publishers=lay.publishers,
                 rank=self.rank,
             )
@@ -291,10 +318,11 @@ class GemmTriggeredAllReduceOp:
 
     def _check_m(self, m: int) -> None:
         lay = self.layout
-        if m < 1 or m > self.m_max or m % lay.mt1 or lay.bands(m) % self.world_size:
+        per = self.world_size * self.unit_bands
+        if m < 1 or m > self.m_max or m % lay.mt1 or lay.bands(m) % per:
             raise ValueError(
                 f"m={m}: need a multiple of {lay.mt1} up to {self.m_max} whose band "
-                f"count divides by {self.world_size}"
+                f"count divides by {per}"
             )
 
     # ── one call ──────────────────────────────────────────────────────────────
@@ -319,10 +347,10 @@ class GemmTriggeredAllReduceOp:
             self._err_ready = None
             if int(self._err_host.item()):
                 self._fault("a device wait of the previous call timed out")
-        lay = self.layout
+        lay, ub = self.layout, self.unit_bands
         bands = lay.bands(m)
         if (
-            self.rs_gates.high() + lay.publishers >= self.rebase_at
+            self.rs_gates.high() + lay.publishers * ub >= self.rebase_at
             or self.ag_gates.high() + self.reducer_blocks >= self.rebase_at
         ):
             self._rebase()
@@ -330,8 +358,10 @@ class GemmTriggeredAllReduceOp:
         snapshot = self._targets.copy()
         status = None
         try:
-            self.rs_gates.expect_first(bands, lay.publishers)
-            self.ag_gates.expect_first(bands // self.world_size, self.reducer_blocks)
+            self.rs_gates.expect_first(bands // ub, lay.publishers * ub)
+            self.ag_gates.expect_first(
+                bands // ub // self.world_size, self.reducer_blocks
+            )
             status = batch.arm(self._targets, self.quiesce_timeout_s)
         except Exception as e:
             self._targets[:] = snapshot
@@ -351,9 +381,9 @@ class GemmTriggeredAllReduceOp:
         batch = self._batches.get(m)
         if batch is not None:
             return batch
-        lay, ws, rank = self.layout, self.world_size, self.rank
-        nk = lay.bands(m) // ws
-        bb, gs, kmax = lay.band_bytes, lay.gate_stride, lay.max_bands_per_rank
+        lay, ws, rank, ub = self.layout, self.world_size, self.rank, self.unit_bands
+        nk = lay.bands(m) // ub // ws
+        bb, gs, kmax = lay.band_bytes * ub, lay.gate_stride, lay.max_bands_per_rank
         ag_slot = lay.max_bands
         inp, out = self.base + lay.input_off, lay.output_off
         batch = TriggerBatch()
@@ -363,23 +393,34 @@ class GemmTriggeredAllReduceOp:
             rs_arr = pb + lay.rs_arrive_off + rank * kmax * gs
             ag_arr = pb + lay.ag_arrive_off + rank * kmax * gs
             for k in range(nk):
-                b = k * ws + d
+                u = d * nk + k if self.contiguous else k * ws + d
                 batch.add(
                     self.q_rs[d],
-                    self.rs_gates.addr(b),
-                    b,
-                    [(inp + b * bb, slot + k * bb, bb)],
+                    self.rs_gates.addr(u),
+                    u,
+                    [(inp + u * bb, slot + k * bb, bb)],
                     rs_arr + k * gs,
                 )
-            for k in range(nk):
-                b = k * ws + rank
+            if self.contiguous:
+                # My whole reduced slice in one copy, once my last unit is reduced.
+                mine = out + rank * nk * bb
                 batch.add(
                     self.q_ag[d],
-                    self.ag_gates.addr(k),
-                    ag_slot + k,
-                    [(self.base + out + b * bb, pb + out + b * bb, bb)],
-                    ag_arr + k * gs,
+                    self.ag_gates.addr(nk - 1),
+                    ag_slot + nk - 1,
+                    [(self.base + mine, pb + mine, nk * bb)],
+                    ag_arr,
                 )
+            else:
+                for k in range(nk):
+                    b = k * ws + rank
+                    batch.add(
+                        self.q_ag[d],
+                        self.ag_gates.addr(k),
+                        ag_slot + k,
+                        [(self.base + out + b * bb, pb + out + b * bb, bb)],
+                        ag_arr + k * gs,
+                    )
             # Completion mark: runs after the queue's last read of my output.
             batch.add(
                 self.q_ag[d],
@@ -448,7 +489,12 @@ class GemmTriggeredAllReduceOp:
         k = self._kernels.get(m)
         if k is None:
             reduce, wait = build_trigger_kernels(
-                self.layout, self.rank, m, reducer_blocks=self.reducer_blocks
+                self.layout,
+                self.rank,
+                m,
+                reducer_blocks=self.reducer_blocks,
+                contiguous=self.contiguous,
+                unit_bands=self.unit_bands,
             )
             k = (_PinnedLaunch(reduce), _PinnedLaunch(wait))
             self._kernels[m] = k
@@ -538,7 +584,7 @@ class GemmTriggeredAllReduceOp:
     def self_test(self, m: int | None = None) -> None:
         """Collective: one call with the gates opened from the host instead of a
         GEMM. Fails fast if a queue never moves (unarmed or dead engine)."""
-        m = m if m is not None else self.layout.mt1 * self.world_size
+        m = m if m is not None else self.layout.mt1 * self.world_size * self.unit_bands
         self.input_view(m).fill_(0.0)
         self.output_view(m).fill_(float("nan"))
         torch.cuda.synchronize()
