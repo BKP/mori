@@ -342,6 +342,9 @@ def build_trigger_kernels(
             local_store_u32(
                 sent_calls, fx.Int32(local_load_u32(sent_calls)) + fx.Int32(1)
             )
+            # The error word, to the host's pinned copy (its address follows the word).
+            host = _load_u64(win + fx.Int64(off.err_off + 8))
+            signal_store_u32(signal_ptr(fx.Int64(host)), fx.Int32(signal_load_u32(err)))
 
     def _launcher(kern, grid):
         name = f"{spec}:{grid}"

@@ -79,14 +79,26 @@ class _Harness:
     def seed(self, rank, call):
         return (call << 8) | rank | (1 << 40)
 
-    def call(self, m, *, mode=0, spin_cycles=0, clobber=False, armed=False, begin=True):
-        """One call; returns whether the output equals the reference exactly."""
+    def call(
+        self,
+        m,
+        *,
+        mode=0,
+        spin_cycles=0,
+        clobber=False,
+        armed=False,
+        begin=True,
+        ahead=False,
+        keep=False,
+    ):
+        """One call; returns whether the output equals the reference exactly, or with
+        ``keep`` a copy of the output for :meth:`check_call`, without synchronising."""
         op, stream = self.op, torch.cuda.current_stream()
         s = stream.cuda_stream
         call = self.calls
         self.calls += 1
         if not armed:
-            op.arm(m)
+            op.arm(m, ahead=ahead)
             if begin:
                 op.begin(m)
         out = op.output_view(m)
@@ -109,11 +121,17 @@ class _Harness:
         if spin_cycles:
             self.spin.launch((1, 1, 1), (64, 1, 1), 0, s, spin_cycles)
         op.complete(m)
+        if keep:
+            return call, m, out.clone()
         if clobber:
             got = out.clone()
             out.fill_(NAN_BF16)
         else:
             got = out
+        return self.check_call(call, m, got)
+
+    def check_call(self, call, m, got):
+        s = torch.cuda.current_stream().cuda_stream
         self.seeds.copy_(
             torch.tensor(
                 [self.seed(r, call) for r in range(self.ws)], dtype=torch.int64
@@ -150,6 +168,27 @@ def _case_exact(h, ms, calls_per_m, unit_bands=None):
     assert h.op.error() == 0
     if h.rank == 0:
         print(f"[rank 0] {h.calls} exact calls, m in {sorted(set(ms))}", flush=True)
+
+
+def _case_ahead(h, ms, calls_per_m):
+    kept = [h.call(m, ahead=True, keep=True) for m in ms for _ in range(calls_per_m)]
+    bad = [m for call, m, got in kept if not h.check_call(call, m, got)]
+    assert not bad, f"inexact calls armed ahead at m={bad}"
+    assert h.op.error() == 0
+
+
+def _case_ahead_fault(h, m, polls):
+    assert h.call(m), "warm-up call inexact"
+    h.comm.barrier()
+    h.op.wait_polls = polls
+    h.call(m, mode=1 if h.rank == 0 else 0, keep=True)
+    timed_out = torch.cuda.Event()
+    timed_out.record()
+    with pytest.raises(RuntimeError, match="faulted"):
+        # Call k+1 is still spinning when call k+2 is armed: no sync, only the error word.
+        h.call(m, ahead=True, spin_cycles=50_000_000, keep=True)
+        timed_out.synchronize()
+        h.op.arm(m, ahead=True)
 
 
 def _case_rebase(h, ms, calls):
@@ -246,6 +285,8 @@ def _case_no_begin(h, ms, calls_per_m):
 
 CASES = {
     "exact": _case_exact,
+    "ahead": _case_ahead,
+    "ahead_fault": _case_ahead_fault,
     "rebase": _case_rebase,
     "missing_add": _case_missing_add,
     "slow_reader": _case_slow_reader,
@@ -367,6 +408,37 @@ def test_varying_m(world_size, reduce_mode, contiguous):
             contiguous=contiguous,
         ),
         dict(ms=ms, calls_per_m=1),
+    )
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("reduce_mode", MODES)
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_arm_ahead(world_size, reduce_mode, contiguous):
+    step = 128 * world_size * _unit_bands(8192, 128, world_size, contiguous)
+    _run(
+        world_size,
+        "ahead",
+        dict(
+            mt0=96,
+            mt1=128,
+            m_max=step * 8,
+            reduce_mode=reduce_mode,
+            contiguous=contiguous,
+        ),
+        dict(ms=[step * 8, step, step * 4, step * 8], calls_per_m=2),
+    )
+
+
+@pytest.mark.parametrize("reduce_mode", MODES)
+def test_arm_ahead_sees_a_timed_out_wait(reduce_mode):
+    _run(
+        4,
+        "ahead_fault",
+        dict(
+            mt0=96, mt1=128, m_max=1024, quiesce_timeout_s=5.0, reduce_mode=reduce_mode
+        ),
+        dict(m=1024, polls=1 << 16 if reduce_mode == "after" else 1 << 18),
     )
 
 

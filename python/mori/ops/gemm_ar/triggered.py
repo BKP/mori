@@ -51,10 +51,11 @@ band through
 ``reduce_mode="concurrent"`` launches the reducer in :meth:`begin`, on a
 high-priority stream, so bands are reduced while the GEMM runs.
 
-Calls are host-synchronous: arm call k+1 only after call k's :meth:`complete` was
-issued, and finish with ``out`` before the next GEMM (concurrent mode: before the
-next :meth:`begin`). :meth:`arm` raises if the previous call's device waits timed
-out; :meth:`check` also verifies every gate. :meth:`close` is collective. The
+Arm call k+1 only after call k's :meth:`complete` was issued, and finish with ``out``
+before the next GEMM (concurrent mode: before the next :meth:`begin`).
+``arm(m, ahead=True)`` does not wait for call k to finish: call k+1's chains queue
+behind call k's. :meth:`arm` raises once an earlier call's device wait timed out;
+:meth:`check` also verifies every gate. :meth:`close` is collective. The
 window must be cco's default uncached memory.
 """
 
@@ -260,6 +261,7 @@ class GemmTriggeredAllReduceOp:
             self.win = comm.register_window(self.mem.ptr, self.mem.size)
             self.base = self.win.local_ptr
             from_gpu_ptr(self.base, (lay.window_bytes,), torch.uint8).zero_()
+            self._set_host_err_ptr()
             torch.cuda.synchronize()
             self.peers = [p for p in range(ws) if p != self.rank]
             self._peer_base = {p: peer_ptr(comm, self.base, p) for p in self.peers}
@@ -337,19 +339,24 @@ class GemmTriggeredAllReduceOp:
                 return q
         return None
 
-    def arm(self, m: int) -> None:
-        """Arm this call's chains on every queue. Host only; launches nothing."""
+    def arm(self, m: int, ahead: bool = False) -> None:
+        """Arm this call's chains on every queue. Host only; launches nothing.
+
+        ``ahead=True`` neither waits for the previous call nor drains the queues; this
+        call's chains queue behind it. A timed-out device wait faults the next arm.
+        """
         self._check_open()
         self._check_m(m)
         if self._armed_m is not None:
             raise RuntimeError(
                 f"call with m={self._armed_m} is armed but not completed"
             )
-        if self._err_ready is not None:
+        if self._err_ready is not None and not (ahead and not self._err_ready.query()):
             self._err_ready.synchronize()
             self._err_ready = None
-            if int(self._err_host.item()):
-                self._fault("a device wait of the previous call timed out")
+        # The wait kernel writes the error word here directly: no sync needed.
+        if int(self._err_host.item()):
+            self._fault("a device wait of an earlier call timed out")
         lay, ub = self.layout, self.unit_bands
         bands = lay.bands(m)
         if (
@@ -365,7 +372,9 @@ class GemmTriggeredAllReduceOp:
             self.ag_gates.expect_first(
                 bands // ub // self.world_size, self.reducer_blocks
             )
-            status = batch.arm(self._targets, self.quiesce_timeout_s)
+            status = batch.arm(self._targets, self.quiesce_timeout_s, drain=not ahead)
+            if ahead and status == TriggerBatch.NO_ROOM:
+                status = batch.arm(self._targets, self.quiesce_timeout_s)
         except Exception as e:
             self._targets[:] = snapshot
             self._fault(f"arming failed: {e!r}", release=False)
@@ -482,8 +491,7 @@ class GemmTriggeredAllReduceOp:
             reduce(self.base, self.wait_polls, stream=stream)
         else:
             torch_stream.wait_event(self._reduced)
-        wait(self.base, self.wait_polls, stream=stream)
-        self._err_host.copy_(self._err_view(), non_blocking=True)
+        wait(self.base, self.wait_polls, stream=stream)  # also writes _err_host
         self._err_ready = torch.cuda.Event()
         self._err_ready.record(torch_stream)
         return self.output_view(m)
@@ -502,6 +510,12 @@ class GemmTriggeredAllReduceOp:
             k = (_PinnedLaunch(reduce), _PinnedLaunch(wait))
             self._kernels[m] = k
         return k
+
+    def _set_host_err_ptr(self) -> None:
+        """The wait kernel copies the error word to this pinned host address."""
+        from_gpu_ptr(self.base + self.layout.err_off + 8, (1,), torch.int64).fill_(
+            self._err_host.data_ptr()
+        )
 
     def _err_view(self) -> torch.Tensor:
         return from_gpu_ptr(self.base + self.layout.err_off, (1,), torch.int32)
@@ -547,6 +561,7 @@ class GemmTriggeredAllReduceOp:
             )
         self.comm.barrier()
         from_gpu_ptr(self.base, (self.layout.control_bytes,), torch.uint8).zero_()
+        self._set_host_err_ptr()
         torch.cuda.synchronize()
         self.rs_gates.reset()
         self.ag_gates.reset()
