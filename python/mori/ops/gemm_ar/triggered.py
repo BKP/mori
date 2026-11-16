@@ -146,8 +146,8 @@ class GemmTriggeredAllReduceOp:
     with ``m / producer.mt1`` bands divisible by ``world_size * unit_bands``. bf16 only.
     ``unit_bands=None`` picks the smallest unit that leaves at most 8 per peer at
     ``m_max``.
-    ``reducer_blocks`` work-groups reduce the bands in order, after the GEMM or
-    beside it (``reduce_mode``). ``ag_engine_offset``
+    ``reducer_blocks`` work-groups reduce the bands in order, after the GEMM (default 128)
+    or beside it (``reduce_mode``, default 32). ``ag_engine_offset``
     ``None`` (default) chains the all-gather behind the reduce-scatter on the link's
     engine; an offset gives it its own queues on another engine (gfx942 only).
     ``wait_polls`` bounds every device wait. Construction is collective.
@@ -163,7 +163,7 @@ class GemmTriggeredAllReduceOp:
         n: int,
         m_max: int,
         producer: GateProducerSpec,
-        reducer_blocks: int = 32,
+        reducer_blocks: int | None = None,
         reduce_mode: str = "after",
         ag_engine_offset: int | None = None,
         ring_bytes: int = 0,
@@ -199,6 +199,9 @@ class GemmTriggeredAllReduceOp:
             raise ValueError(
                 f"unit_bands={unit_bands} must divide the {per} bands per rank at m_max"
             )
+        if reducer_blocks is None:
+            # After the GEMM the whole GPU is free; beside it, the CU/4 guard applies.
+            reducer_blocks = 128 if reduce_mode == "after" else 32
         if reducer_blocks < 1:
             raise ValueError("reducer_blocks must be >= 1")
         if reduce_mode not in ("after", "concurrent"):

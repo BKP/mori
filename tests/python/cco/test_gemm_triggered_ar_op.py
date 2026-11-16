@@ -153,7 +153,8 @@ def _case_exact(h, ms, calls_per_m, unit_bands=None):
 
 
 def _case_rebase(h, ms, calls):
-    h.op.rebase_at = h.op.layout.publishers * 5  # a re-base before every 5th call
+    per_call = max(h.op.layout.publishers * h.op.unit_bands, h.op.reducer_blocks)
+    h.op.rebase_at = per_call * 5  # a re-base before every 5th call
     bad = [i for i in range(calls) if not h.call(ms[i % len(ms)])]
     assert not bad, f"inexact calls {bad}"
     assert h.op.rebases == (calls - 1) // 4, f"{h.op.rebases} re-bases"
@@ -199,6 +200,7 @@ def _case_misuse(h, m):
     from mori.ops.gemm_ar import GateProducerSpec, GemmTriggeredAllReduceOp
 
     op = h.op
+    assert op.reducer_blocks == (128 if op.reduce_mode == "after" else 32)
     for bad, why in (
         (dict(reducer_blocks=0), "reducer_blocks"),
         (dict(reduce_mode="beside"), "reduce_mode"),
