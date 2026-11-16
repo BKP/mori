@@ -953,6 +953,7 @@ def compile_fused_gemm_scatter(
     scale_prefetch: bool | None = None,
     gate_tail: bool = False,
     gate_scope: str = "system",
+    unit_bands: int = 1,
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -962,6 +963,8 @@ def compile_fused_gemm_scatter(
     the address of band 0's gate, and band ``b``'s gate sits at
     ``win + b * GATE_STRIDE`` -- the layout of ``GemmTriggeredAllReduceOp``'s
     reduce-scatter gates, so the kernel can drive that op directly.
+    ``unit_bands`` > 1 keys one gate per ``unit_bands`` bands: band ``b`` adds to
+    gate ``b // unit_bands``.
 
     ``gate_scope`` is the release's scope. ``"system"`` writes the L2 back
     first (``buffer_wbl2``), which a cached C needs before a copy engine reads
@@ -1216,6 +1219,10 @@ def compile_fused_gemm_scatter(
         raise ValueError("gate_tail replaces the scatter epilogue: pass fuse=False")
     if gate_scope not in ("system", "agent"):
         raise ValueError(f"gate_scope must be 'system' or 'agent', got {gate_scope!r}")
+    if unit_bands < 1 or (unit_bands > 1 and not gate_tail):
+        raise ValueError(
+            f"unit_bands must be >= 1 and needs gate_tail, got {unit_bands}"
+        )
     gate_syncscope = "" if gate_scope == "system" else "agent"
     if chunk_bands and (not fuse or direct_lsa):
         raise ValueError("chunk_bands requires fused SDMA")
@@ -1267,7 +1274,9 @@ def compile_fused_gemm_scatter(
         _kname_tag += "F"
 
     if gate_tail:
-        _kind = "gateA" if gate_scope == "agent" else "gate"
+        _kind = ("gateA" if gate_scope == "agent" else "gate") + (
+            f"u{unit_bands}" if unit_bands > 1 else ""
+        )
     else:
         _kind = transport if fuse else "split"
     _kname = (
@@ -1819,11 +1828,14 @@ def compile_fused_gemm_scatter(
             # parked on that gate reads the band from memory: at system scope the
             # release writes the L2 back first; at agent scope C must be uncached.
             wait_barrier(0)
+            gate_idx = block_m
+            if const_expr(unit_bands > 1):
+                gate_idx = block_m // fx.Int32(unit_bands)
             if fx.thread_idx.x == 0:
                 _llvm_d.atomicrmw(
                     _llvm_d.AtomicBinOp.add,
                     signal_ptr(
-                        fx.Int64(win) + fx.Int64(block_m) * fx.Int64(GATE_STRIDE)
+                        fx.Int64(win) + fx.Int64(gate_idx) * fx.Int64(GATE_STRIDE)
                     ),
                     fx.Int64(1).ir_value(),
                     _llvm_d.AtomicOrdering.release,
