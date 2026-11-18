@@ -434,7 +434,7 @@ void AnvilLib::init() {
   return -1;
 }
 
-std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode) {
+std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode, bool deviceDoorbells) {
   std::vector<uint32_t> engines;
   engines.reserve(2);
   if (srcNode == dstNode) {
@@ -493,17 +493,16 @@ std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode) {
     }
   }
 
-  // MI308X is a 4-XCD harvest of the 8-XCD MI300X: only 4 physical SDMA engines
-  // exist, exposed at the even KFD logical engine ids (0,2,4,6); the odd ids
-  // (1,3,5,7) name fused-off engines. IP-discovery firmware still advertises the
-  // full MI300X layout (2 general + 6 xGMI = 8) and recommended_sdma_engine_id_mask
-  // points at odd ids for many links (this box lacks the upstream amdkfd
-  // "rec SDMA engines with limited XGMI" fix). Creating a queue on an odd id and
-  // ringing its doorbell hangs, so fold every selected id down to its backing
-  // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
-  // budget is not double-charged.
-  const bool mi308x = isMi308x(srcNode);
-  if (mi308x) {
+  // On MI308X (a 4-XCD harvest of the 8-XCD MI300X) a doorbell written from
+  // device code to a queue on an odd engine id (1,3,5,7) hangs, a firmware bug
+  // being fixed. IP-discovery firmware still advertises the full MI300X layout
+  // (2 general + 6 xGMI = 8) and recommended_sdma_engine_id_mask points at odd ids
+  // for many links (this box lacks the upstream amdkfd "rec SDMA engines with
+  // limited XGMI" fix). So for device-rung queues, fold every selected id down to
+  // its backing even engine (id & ~1) and dedup, preserving order, so the per-engine
+  // queue budget is not double-charged. Doorbells written from the host do not hang,
+  // so host-rung queues (deviceDoorbells false) keep the odd ids.
+  if (deviceDoorbells && isMi308x(srcNode)) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -523,7 +522,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // Spread the channels across the engines recommended for this peer link. On
   // MI350 the mask typically reports 2 engines per peer; on platforms with a
   // single recommended engine all channels share it.
-  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode);
+  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode, /*deviceDoorbells=*/true);
   const bool mi308x = isMi308x(srcNode);
   const int numEngines = static_cast<int>(engines.size());
 
@@ -601,7 +600,7 @@ std::unique_ptr<SdmaGatedQueue> AnvilLib::createGatedQueue(int srcNode, int dstN
   std::vector<uint32_t> engines;
   {
     std::lock_guard<std::mutex> lock(channels_mutex_);  // for linkEngines()
-    engines = linkEngines(srcNode, dstNode);
+    engines = linkEngines(srcNode, dstNode, /*deviceDoorbells=*/false);
   }
   uint32_t engineId = engines.front();
   if (engineOffset != 0) {
@@ -618,11 +617,6 @@ std::unique_ptr<SdmaGatedQueue> AnvilLib::createGatedQueue(int srcNode, int dstN
       return nullptr;
     }
     engineId = static_cast<uint32_t>(first + (engineId - first + engineOffset) % count);
-    // See linkEngines(): an odd engine on MI308X is fused off and hangs.
-    if (isMi308x(srcNode) && (engineId & 1u)) {
-      MORI_APP_ERROR("SDMA: engine {} does not exist on MI308X", engineId);
-      return nullptr;
-    }
   }
   return SdmaGatedQueue::Create(hsakmtNodeForKfdNode(srcNode), engineId, ringBytes,
                                 hdpFlushRegister(srcNode));

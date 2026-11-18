@@ -163,8 +163,10 @@ class AnvilLib {
   int getSdmaEngineId(int srcNode, int dstNode);
 
   // Engines for the src->dst link, in the order connect() assigns them to channels
-  // (except MI308X peer links, which connect() balances). Assumes channels_mutex_ is held.
-  std::vector<uint32_t> linkEngines(int srcNode, int dstNode);
+  // (except MI308X peer links, which connect() balances). deviceDoorbells: device
+  // code rings the queue, so MI308X's odd engines are avoided. Assumes
+  // channels_mutex_ is held.
+  std::vector<uint32_t> linkEngines(int srcNode, int dstNode, bool deviceDoorbells);
 
   // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
   // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0
@@ -183,8 +185,8 @@ class AnvilLib {
   // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
   bool isGfx1250(int node);
 
-  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X
-  // whose odd-numbered SDMA engine ids are fused off. connect() folds selected
+  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X,
+  // whose odd SDMA engine ids hang on device-rung doorbells. connect() folds selected
   // engine ids down to the backing even engine on this part and balances its
   // peer links over the xGMI engines.
   bool isMi308x(int deviceId);
