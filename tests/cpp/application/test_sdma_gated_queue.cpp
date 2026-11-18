@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "mori/application/transport/sdma/anvil.hpp"
@@ -122,7 +123,7 @@ TEST(SdmaGatedQueue, EngineOffsetMovesTheQueue) {
   auto q0 = anvil::anvil.createGatedQueue(Node(0), Node(1), 0);
   ASSERT_NE(q0, nullptr);
   auto q1 = anvil::anvil.createGatedQueue(Node(0), Node(1), 1);
-  if (q1 == nullptr) GTEST_SKIP() << "offset 1 refused here (e.g. MI308X)";
+  ASSERT_NE(q1, nullptr);
   EXPECT_NE(q1->hostHandle().engineId, q0->hostHandle().engineId);
 }
 
@@ -146,6 +147,50 @@ TEST(SdmaGatedQueue, HostDrivenCopy) {
   ASSERT_TRUE(HostCopy(h, src.p, dst.p, kBytes, 1)) << "engine did not consume the packet";
   ASSERT_EQ(hipMemcpy(got.data(), dst.p, kBytes, hipMemcpyDeviceToHost), hipSuccess);
   EXPECT_EQ(std::memcmp(got.data(), want.data(), kBytes), 0);
+}
+
+// Host-rung queues on every engine of the link's class, odd ids included (device
+// doorbells avoid those on MI308X). Peer link 0 -> 1 if there are two GPUs.
+TEST(SdmaGatedQueue, HostDrivenCopyOnEveryEngine) {
+  if (DeviceCount() < 1) GTEST_SKIP() << "no GPU";
+  const int peer = DeviceCount() >= 2 ? 1 : 0;
+  if (peer != 0) {
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    const hipError_t e = hipDeviceEnablePeerAccess(peer, 0);
+    (void)hipGetLastError();
+    if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled)
+      GTEST_SKIP() << "no peer access 0 -> " << peer;
+  }
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr int kPackets = 4;
+  DeviceBuffer src(0, kBytes), dst(peer, kBytes);
+  ASSERT_NE(src.p, nullptr);
+  ASSERT_NE(dst.p, nullptr);
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+  std::set<uint32_t> engines;
+  int odd = 0;
+  for (int offset = 0; offset < 32; offset++) {
+    auto q = anvil::anvil.createGatedQueue(Node(0), Node(peer), offset);
+    ASSERT_NE(q, nullptr) << "offset " << offset;
+    const anvil::SdmaGatedQueueHandle h = q->hostHandle();
+    if (!engines.insert(h.engineId).second) break;  // wrapped around the class
+    odd += h.engineId & 1u;
+
+    const std::vector<uint32_t> want = Pattern(kBytes, h.engineId);
+    std::vector<uint32_t> got(want.size(), 0);
+    ASSERT_EQ(hipMemcpy(src.p, want.data(), kBytes, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(dst.p, 0, kBytes), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    ASSERT_TRUE(HostCopy(h, src.p, dst.p, kBytes, kPackets)) << "engine " << h.engineId << " hung";
+    ASSERT_EQ(hipMemcpy(got.data(), dst.p, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(std::memcmp(got.data(), want.data(), kBytes), 0) << "engine " << h.engineId;
+  }
+  RecordProperty("engines", static_cast<int>(engines.size()));
+  RecordProperty("odd_engines", odd);
+  EXPECT_GT(odd, 0) << "no odd engine reached";
 }
 
 TEST(SdmaGatedQueue, ConnectFailsInsteadOfExiting) {
