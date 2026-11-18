@@ -123,6 +123,10 @@ class AnvilLib {
 
   int getSdmaEngineId(int srcNode, int dstNode);
 
+  // Engines for the src->dst link, in the order connect() assigns them to channels
+  // (except MI308X peer links, which connect() balances). Assumes channels_mutex_ is held.
+  std::vector<uint32_t> linkEngines(int srcNode, int dstNode);
+
   // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
   // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0
   // if the link or property is unavailable, in which case callers fall back to

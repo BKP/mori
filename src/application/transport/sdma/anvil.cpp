@@ -230,10 +230,7 @@ uint32_t hsakmtNodeForKfdNode(int node) {
   exit(EXIT_FAILURE);
 }
 
-}  // namespace
-
-SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
-  // Allocate SDMA queue buffer on device side, requires ExecuteAccess
+HsaMemFlags ringMemFlags() {
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
   memFlags.ui32.HostAccess = 1;
@@ -241,6 +238,13 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   memFlags.ui32.NoNUMABind = 1;
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
+  return memFlags;
+}
+
+}  // namespace
+
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
+  HsaMemFlags memFlags = ringMemFlags();
 
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
@@ -355,11 +359,7 @@ void AnvilLib::init() {
   return -1;
 }
 
-bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
-  std::lock_guard<std::mutex> lock(channels_mutex_);
-  // Spread the channels across the engines recommended for this peer link. On
-  // MI350 the mask typically reports 2 engines per peer; on platforms with a
-  // single recommended engine all channels share it.
+std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode) {
   std::vector<uint32_t> engines;
   engines.reserve(2);
   if (srcNode == dstNode) {
@@ -397,7 +397,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
         uint32_t e = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
         if (mask & (1u << e)) {
           engines.assign(1, e);
-          static bool logged = false;  // connect() runs under channels_mutex_
+          static bool logged = false;  // callers hold channels_mutex_
           if (!logged) {
             logged = true;
             MORI_APP_INFO(
@@ -440,7 +440,16 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     }
     engines.swap(evenEngines);
   }
+  return engines;
+}
 
+bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  // Spread the channels across the engines recommended for this peer link. On
+  // MI350 the mask typically reports 2 engines per peer; on platforms with a
+  // single recommended engine all channels share it.
+  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode);
+  const bool mi308x = isMi308x(srcNode);
   const int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
@@ -452,7 +461,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   if (static_cast<int>(channels.size()) < numChannels) {
     const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
-    // The fold above puts several of a MI308X GPU's peer links on one engine
+    // linkEngines()' fold puts several of a MI308X GPU's peer links on one engine
     // (masks 0x40 and 0x80 both land on 6), serialising its copies to those
     // peers, so its peer links are balanced over the xGMI engines instead.
     const bool balance = mi308x && srcNode != dstNode;
@@ -537,7 +546,7 @@ uint32_t AnvilLib::getAnyLinkEngineMask(int srcNode) {
 }
 
 // gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
-// engines. See connect() for why.
+// engines. See linkEngines() for why.
 bool AnvilLib::isGfx1250(int node) {
   // libhsakmt's EngineId: major = v / 10000 % 100, minor = v / 100 % 100.
   const uint64_t v = kfdNodeProperty(node, "gfx_target_version");
@@ -546,7 +555,7 @@ bool AnvilLib::isGfx1250(int node) {
 
 // MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
 // gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
-// See connect() for why its odd SDMA engine ids must be avoided.
+// See linkEngines() for why its odd SDMA engine ids must be avoided.
 bool AnvilLib::isMi308x(int node) { return kfdNodeProperty(node, "device_id") == 0x74A2; }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int idx) {
