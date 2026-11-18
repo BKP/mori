@@ -18,6 +18,11 @@ description: >-
   although VRAM is free, or hipMemGetInfo exceeds the card. It behaves differently on
   amdgpu-dkms 30.x and 31.10-31.60. The fix is upstream and in an internal amdgpu-dkms
   build; no public amdgpu-dkms release has it, but the upstream patch applies to DKMS.
+  (5) on gfx942 and gfx950 without Linux commit f145d5b3f740 (amdkfd; v7.3, stable
+  6.6.160, 6.12.113, 6.18.57, 7.2.11), a doorbell written from
+  device code to an SDMA queue on an odd engine rings the previous engine, so the copy
+  stalls (hundreds of ms, or for good); MoRI detects the fix at run time and keeps
+  device-rung queues on even engines without it (MORI_SDMA_ODD_ENGINES overrides).
 ---
 
 # MORI Known Issues
@@ -541,3 +546,52 @@ client. Its `amd_acquire()` (`kfd_peerdirect.c`, untouched by the fix) dereferen
 `ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
 to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
 6.16.6 + ionic crashed its node.
+
+---
+
+## Issue 5 — Device-rung SDMA doorbells of odd engines ring the previous engine
+
+**Affects:** MI300X, MI325X and MI308X (gfx942, GC 9.4.3 / 9.4.4) and MI355X (gfx950,
+GC 9.5.0) on amdgpu without Linux commit `f145d5b3f740` ("drm/amdkfd: align SDMA
+doorbell base for shader doorbell writes"). Mainline has it from v7.3 (merged for
+v7.3-rc7), and stable from 6.6.160, 6.12.113, 6.18.57 and 7.2.11. amdgpu-dkms 6.16.13
+(ROCm 7.2.4) does not have it. Only
+queues whose doorbell device code rings are affected: MoRI's shared SDMA channels
+(shmem, cco, EP). Doorbells written from the host, such as MoRI's gated queues and the
+kernel's own SDMA rings, reach the right engine.
+
+**Symptoms:** a copy a kernel posts to an SDMA queue on an odd engine id stalls, since the
+engine never sees the doorbell. With MoRI's device put, which also writes the queue's write
+pointer, it runs only when the engine next reads that pointer on its own: 160–700 ms
+instead of 0.25 ms for a 1 MiB copy on MI300X with amdgpu-dkms 6.16.13. Submission paths
+that rely on the doorbell alone stall for good. The same code is fast on even engines, and
+on an odd engine's later queue slots. It shows up where MoRI puts channels on odd engines:
+MI308X links whose recommended engine is odd, and links where KFD reports every xGMI
+engine (SR-IOV VFs, hives other than 8 GPUs).
+
+**Root cause:** on these GCs a shader's doorbell write is routed to an SDMA engine at 32-byte
+(4 doorbell index) granularity. Engine doorbell ranges are 10 indices apart, so each odd
+engine's range starts 2 indices into a block that belongs to the previous engine, and a
+queue in its first two slots (queues 0–3 of the engine's 8) rings that engine instead. The
+fix aligns each odd engine's doorbell base to 4 indices; host writes were never affected.
+
+**What MoRI does:** at the first SDMA use of a GPU it makes throwaway host-rung queues on an
+even engine and its odd sibling and reads where amdkfd put their doorbells (a doorbell's
+page offset / 8 is its index mod 512). An odd engine's first queue lands 10 indices past
+the even engine's range start on an affected driver and 12 past it on a fixed one. It logs
+one line per GPU, either `... lacks amdkfd commit f145d5b3f740 ... device-rung SDMA queues
+use even engines only` or `... amdkfd has commit f145d5b3f740; device-rung queues may use
+odd engines`. Without the fix, device-rung queues fold each odd engine to its even sibling;
+with it they use odd engines too. Gated queues use every engine either way.
+`MORI_SDMA_ODD_ENGINES=on` allows odd engines regardless (they hang on affected drivers),
+`off` keeps device-rung queues on even engines, and `auto` (the default) checks.
+
+**Fix:** a kernel or amdgpu build with `f145d5b3f740`
+(https://git.kernel.org/torvalds/c/f145d5b3f740de05d85257acdc82f6877180f5c6, cherry-picked
+from drm-next `ee1379e6d7da`; it fixes `6df442a03d1a`, "drm/amdgpu: add new doorbell
+assignment table for aqua_vanjaram"). The patch notes that a CRIU checkpoint taken before
+it that holds an SDMA queue on an odd engine fails to restore (`-EINVAL`).
+
+**Verification:** `test_sdma_gated_queue --gtest_filter='SdmaDeviceQueue.*'` reports
+`odd_engines_allowed` (1 with the fix) and checks that a kernel's copy completes on every
+channel, odd engines included.

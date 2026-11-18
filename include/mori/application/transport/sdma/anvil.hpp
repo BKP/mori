@@ -53,8 +53,11 @@ class SdmaQueue {
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
+  uint32_t engineId() const;
 
  private:
+  friend class AnvilLib;
+  uint32_t engineId_;
   uint64_t* cachedWptr_;
   uint64_t* committedWptr_;
   void* queueBuffer_;
@@ -96,6 +99,36 @@ class SdmaGatedQueue {
   uint32_t engineId_{0};
 };
 
+// Where amdkfd put a queue on an odd SDMA engine, judged by doorbell index on GC 9.4.3,
+// 9.4.4 and 9.5.0. Device code rings SDMA doorbells at 4-index granularity there, and
+// engine doorbell ranges are 10 indices apart, so without kernel commit f145d5b3f740 the
+// first two queue slots of each odd engine ring the previous engine.
+enum class OddEngineDoorbell {
+  kMisrouted,  // a device-rung doorbell rings the previous engine
+  kRouted,     // reaches this engine on any kernel
+  kFixed,      // reaches it, and only a fixed kernel puts a queue here
+  kUnknown,    // not that layout
+};
+
+// evenIndex is the doorbell index of any queue on evenEngine of the same GPU; all
+// indices are mod 512.
+inline OddEngineDoorbell ClassifyOddEngineDoorbell(uint32_t evenEngine, uint32_t evenIndex,
+                                                   uint32_t oddEngine, uint32_t oddIndex) {
+  const int64_t base = static_cast<int64_t>(evenIndex & ~3u) +
+                       10 * (static_cast<int64_t>(oddEngine) - static_cast<int64_t>(evenEngine));
+  const int64_t d = ((static_cast<int64_t>(oddIndex) - base) % 512 + 512) % 512;
+  if (d <= 1) return OddEngineDoorbell::kMisrouted;
+  if (d <= 3) return OddEngineDoorbell::kRouted;
+  if (d <= 5) return OddEngineDoorbell::kFixed;
+  return OddEngineDoorbell::kUnknown;
+}
+
+// Doorbell index (mod 512) of a queue from its host-mapped doorbell: doorbells are 8
+// bytes and the mapping keeps the page offset.
+inline uint32_t DoorbellIndex(const volatile void* doorbell) {
+  return static_cast<uint32_t>((reinterpret_cast<uintptr_t>(doorbell) & 0xfff) / 8);
+}
+
 class AnvilLib {
  private:
   // Make constructor private
@@ -129,6 +162,12 @@ class AnvilLib {
   // pair's shared channels and has no device handle. Owned by the caller.
   std::unique_ptr<SdmaGatedQueue> createGatedQueue(int srcNode, int dstNode, int engineOffset = 0,
                                                    uint64_t ringBytes = SDMA_QUEUE_SIZE);
+
+  // Whether device-rung queues on this node may use odd SDMA engines.
+  // MORI_SDMA_ODD_ENGINES=on or off decides; auto (the default) checks gfx942 and gfx950
+  // for amdkfd commit f145d5b3f740 and allows them elsewhere. Gated queues use every
+  // engine regardless.
+  bool deviceQueuesUseOddEngines(int node);
 
   // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
   // (e.g. the examples) that only have HIP device ids; multi-process collectives
@@ -169,8 +208,8 @@ class AnvilLib {
 
   // Engines for the src->dst link, in the order connect() assigns them to channels
   // (except MI308X peer links, which connect() balances). deviceDoorbells: device
-  // code rings the queue, so MI308X's odd engines are avoided. Assumes
-  // channels_mutex_ is held.
+  // code rings the queue, so odd engines are avoided unless deviceQueuesUseOddEngines().
+  // Assumes channels_mutex_ is held.
   std::vector<uint32_t> linkEngines(int srcNode, int dstNode, bool deviceDoorbells);
 
   // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
@@ -190,15 +229,26 @@ class AnvilLib {
   // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
   bool isGfx1250(int node);
 
-  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X,
-  // whose odd SDMA engines device-rung queues avoid (see linkEngines()). connect() folds selected
-  // engine ids down to the backing even engine on this part and balances its
-  // peer links over the xGMI engines.
+  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X.
+  // connect() balances its peer links over the xGMI engines, the odd ones only when
+  // deviceQueuesUseOddEngines().
   bool isMi308x(int deviceId);
 
-  // MI308X only; see connect(). Both assume channels_mutex_ is held.
+  // MI308X only; see connect(). All assume channels_mutex_ is held.
+  std::vector<uint32_t> mi308xXgmiEngines(int srcNode);
   uint32_t mi308xLinkEngine(int srcNode, int dstNode, const std::vector<uint32_t>& recommended);
   uint32_t mi308xQueueEngine(int srcNode, int dstNode);
+
+  // deviceQueuesUseOddEngines() and its doorbell checks; all assume channels_mutex_ is held.
+  struct DoorbellLayout {
+    bool oddEngines{false};
+    bool haveRef{false};  // evenEngine/evenIndex come from a probed queue
+    uint32_t evenEngine{0};
+    uint32_t evenIndex{0};
+  };
+  bool oddEnginesForDeviceQueues(int node);
+  void probeShaderDoorbellFix(int node, DoorbellLayout& layout);
+  bool deviceDoorbellReaches(int node, const SdmaQueue& q);
 
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
@@ -218,6 +268,7 @@ class AnvilLib {
     std::array<int, 8> queues{};
   };
   std::unordered_map<int, Mi308xEngineUse> mi308x_engine_use_;
+  std::unordered_map<int, DoorbellLayout> doorbell_layout_;
   std::unordered_map<std::pair<int, int>, uint32_t, PairHash> mi308x_link_engine_;
 };
 

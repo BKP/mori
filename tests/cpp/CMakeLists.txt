@@ -44,9 +44,16 @@ target_include_directories(test_transport_tcp PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_transport_tcp mori_application)
 
 add_executable(test_sdma_gated_queue application/test_sdma_gated_queue.cpp)
+set_source_files_properties(application/test_sdma_gated_queue.cpp
+                            PROPERTIES LANGUAGE HIP)
 target_include_directories(test_sdma_gated_queue
                            PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(test_sdma_gated_queue mori_application gtest_main)
+target_link_libraries(test_sdma_gated_queue mori_application gtest_main hip::host
+                      hip::device)
+if(DEFINED GPU_TARGETS)
+  set_target_properties(test_sdma_gated_queue PROPERTIES HIP_ARCHITECTURES
+                                                         "${GPU_TARGETS}")
+endif()
 
 add_executable(test_transport_ibverbs application/test_transport_ibverbs.cpp)
 

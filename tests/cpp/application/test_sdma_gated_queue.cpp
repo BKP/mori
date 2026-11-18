@@ -211,4 +211,78 @@ TEST(SdmaGatedQueue, ConnectFailsInsteadOfExiting) {
   EXPECT_NE(anvil::anvil.getSdmaQueue(n, p, 0), nullptr);
 }
 
+TEST(SdmaDoorbell, ClassifiesOddEngineDoorbells) {
+  using anvil::ClassifyOddEngineDoorbell;
+  using anvil::OddEngineDoorbell;
+  EXPECT_EQ(anvil::DoorbellIndex(reinterpret_cast<void*>(0x7f00000008a0)), 276u);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 286), OddEngineDoorbell::kMisrouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 277, 3, 287), OddEngineDoorbell::kMisrouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(4, 296, 3, 286), OddEngineDoorbell::kMisrouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 288), OddEngineDoorbell::kRouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 289), OddEngineDoorbell::kRouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 290), OddEngineDoorbell::kFixed);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 291), OddEngineDoorbell::kFixed);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(14, 506, 15, 2), OddEngineDoorbell::kMisrouted);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(14, 506, 15, 6), OddEngineDoorbell::kFixed);
+  EXPECT_EQ(ClassifyOddEngineDoorbell(2, 276, 3, 300), OddEngineDoorbell::kUnknown);
+}
+
+__global__ void DevicePut(anvil::SdmaQueueDeviceHandle* h, void* dst, void* src, size_t bytes) {
+  anvil::SdmaQueueDeviceHandle handle = *h;
+  anvil::put(handle, dst, src, bytes);
+}
+
+// One channel from GPU 0 to every peer; a kernel copies through each. Odd engines appear
+// only if deviceQueuesUseOddEngines().
+TEST(SdmaDeviceQueue, FollowsTheDoorbellVerdict) {
+  const int count = DeviceCount();
+  if (count < 2) GTEST_SKIP() << "needs two GPUs";
+  const int n = Node(0);
+  const bool odd = anvil::anvil.deviceQueuesUseOddEngines(n);
+  RecordProperty("odd_engines_allowed", odd ? 1 : 0);
+
+  constexpr size_t kBytes = 1 << 20;
+  DeviceBuffer src(0, kBytes);
+  ASSERT_NE(src.p, nullptr);
+  int oddUsed = 0;
+  for (int peer = 1; peer < count; peer++) {
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    const hipError_t e = hipDeviceEnablePeerAccess(peer, 0);
+    (void)hipGetLastError();
+    ASSERT_TRUE(e == hipSuccess || e == hipErrorPeerAccessAlreadyEnabled) << "peer " << peer;
+    ASSERT_TRUE(anvil::anvil.connect(n, Node(peer), 1)) << "peer " << peer;
+    anvil::SdmaQueue* q = anvil::anvil.getSdmaQueue(n, Node(peer), 0);
+    ASSERT_NE(q, nullptr);
+    const uint32_t engine = q->engineId();
+    if (!odd) EXPECT_EQ(engine & 1u, 0u) << "peer " << peer;
+    oddUsed += engine & 1u;
+
+    DeviceBuffer dst(peer, kBytes);
+    ASSERT_NE(dst.p, nullptr);
+    ASSERT_EQ(hipMemset(dst.p, 0, kBytes), hipSuccess);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    const std::vector<uint32_t> want = Pattern(kBytes, engine);
+    ASSERT_EQ(hipMemcpy(src.p, want.data(), kBytes, hipMemcpyHostToDevice), hipSuccess);
+    DevicePut<<<1, 1>>>(q->deviceHandle(), dst.p, src.p, kBytes);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    // A misrouted doorbell leaves the copy until the engine reads its write pointer on its
+    // own, hundreds of ms later; a delivered one lands in well under a millisecond.
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint32_t> got(want.size(), 0);
+    bool same = false;
+    while (!same && std::chrono::steady_clock::now() < start + std::chrono::seconds(5)) {
+      ASSERT_EQ(hipMemcpy(got.data(), dst.p, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+      same = std::memcmp(got.data(), want.data(), kBytes) == 0;
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    EXPECT_TRUE(same) << "engine " << engine << " (peer " << peer << ") ran no device-rung copy";
+    EXPECT_LT(ms, 50.0) << "engine " << engine << " (peer " << peer
+                        << "): the doorbell did not reach the engine";
+  }
+  RecordProperty("odd_engines_used", oddUsed);
+}
+
 }  // namespace

@@ -71,10 +71,23 @@ namespace {
     }                                                                                     \
   } while (0)
 
-// MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
-// copies. KFD exposes 8 user-queue slots per engine on gfx942.
-constexpr std::array<uint32_t, 3> kMi308xXgmiEngines = {2u, 4u, 6u};
+// KFD exposes 8 user-queue slots per engine on gfx942.
 constexpr int kMi308xQueuesPerEngine = 8;
+
+enum class OddEnginesMode { kAuto, kOn, kOff };
+
+// MORI_SDMA_ODD_ENGINES: auto (default), on or off; see deviceQueuesUseOddEngines().
+OddEnginesMode oddEnginesMode() {
+  static const OddEnginesMode mode = [] {
+    const char* v = std::getenv("MORI_SDMA_ODD_ENGINES");
+    if (v == nullptr || *v == '\0' || std::strcmp(v, "auto") == 0) return OddEnginesMode::kAuto;
+    if (std::strcmp(v, "on") == 0) return OddEnginesMode::kOn;
+    if (std::strcmp(v, "off") == 0) return OddEnginesMode::kOff;
+    MORI_APP_WARN("SDMA: MORI_SDMA_ODD_ENGINES={} is not auto, on or off; using auto", v);
+    return OddEnginesMode::kAuto;
+  }();
+  return mode;
+}
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -187,6 +200,14 @@ uint64_t kfdGpuId(int node) {
   return id;
 }
 
+// GC 9.4.3 and 9.4.4 (gfx942) and 9.5.0 (gfx950): device-rung doorbells of odd SDMA
+// engines need Linux commit f145d5b3f740 ("drm/amdkfd: align SDMA doorbell base for
+// shader doorbell writes"), in v7.3 and stable 6.6.160, 6.12.113, 6.18.57 and 7.2.11.
+bool needsShaderDoorbellFix(int node) {
+  const uint64_t v = kfdNodeProperty(node, "gfx_target_version");
+  return v == 90402 || v == 90500;
+}
+
 struct KfdLink {
   int nodeTo;
   uint32_t recSdmaEngIdMask;
@@ -259,7 +280,7 @@ HsaMemFlags ringMemFlags() {
 
 }  // namespace
 
-SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) : engineId_(engineId) {
   HsaMemFlags memFlags = ringMemFlags();
 
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
@@ -324,6 +345,8 @@ SdmaQueue::~SdmaQueue() {
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
+
+uint32_t SdmaQueue::engineId() const { return engineId_; }
 
 std::unique_ptr<SdmaGatedQueue> SdmaGatedQueue::Create(uint32_t hsakmtNodeId, uint32_t engineId,
                                                        uint64_t ringBytes,
@@ -471,8 +494,9 @@ std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode, bool devic
     // a copy started by a doorbell written from device code never runs. The static OAM table
     // is the kernel's per-peer table for an 8-GPU hive, so use it for a 14-engine mask and
     // only if the mask holds the engine it picks; otherwise (other parts, partition modes,
-    // an unreadable or out-of-range xGMI id) keep the KFD mask.
-    if (engines.size() == 14) {
+    // an unreadable or out-of-range xGMI id) keep the KFD mask. Device-rung channels keep
+    // the mask too when deviceQueuesUseOddEngines().
+    if (engines.size() == 14 && !(deviceDoorbells && oddEnginesForDeviceQueues(srcNode))) {
       try {
         uint32_t e = static_cast<uint32_t>(getSdmaEngineId(srcNode, dstNode));
         if (mask & (1u << e)) {
@@ -498,19 +522,19 @@ std::vector<uint32_t> AnvilLib::linkEngines(int srcNode, int dstNode, bool devic
     }
   }
 
-  // On MI308X (a 4-XCD harvest of the 8-XCD MI300X) IP-discovery firmware still
-  // advertises the full MI300X layout (2 general + 6 xGMI = 8) and
-  // recommended_sdma_engine_id_mask points at odd ids for many links (this box lacks
-  // the upstream amdkfd "rec SDMA engines with limited XGMI" fix). amdkfd routes a
-  // doorbell written from device code to a queue on an odd engine id to the previous
-  // engine, so the queue misses it and its work stalls. Linux commit f145d5b3f740
-  // ("drm/amdkfd: align SDMA doorbell base for shader doorbell writes", in v7.3 and
-  // stable 6.6.160, 6.12.113, 6.18.57 and 7.2.11) fixes it. So for device-rung queues,
-  // fold every selected id down to its even sibling (id & ~1) and dedup, preserving
-  // order, so the per-engine queue budget is not double-charged. Doorbells written
-  // from the host reach the right engine, so host-rung queues (deviceDoorbells false)
-  // keep the odd ids.
-  if (deviceDoorbells && isMi308x(srcNode)) {
+  // amdkfd routes a doorbell written from device code to a queue on an odd SDMA engine
+  // to the previous engine on gfx942 and gfx950, so the queue misses it and its work
+  // stalls, unless the
+  // kernel has commit f145d5b3f740 (see deviceQueuesUseOddEngines()). Without it, fold
+  // every selected id down to its even sibling (id & ~1) for device-rung queues and
+  // dedup, preserving order, so the per-engine queue budget is not double-charged.
+  // MI308X (a 4-XCD harvest of the 8-XCD MI300X) needs this most: IP-discovery firmware
+  // still advertises the full MI300X layout (2 general + 6 xGMI = 8) and
+  // recommended_sdma_engine_id_mask points at odd ids for many links (this box lacks the
+  // upstream amdkfd "rec SDMA engines with limited XGMI" fix). Doorbells written from the
+  // host reach the right engine, so host-rung queues (deviceDoorbells false) keep the
+  // odd ids.
+  if (deviceDoorbells && !oddEnginesForDeviceQueues(srcNode)) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -567,8 +591,22 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
         const uint32_t engineId =
             balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
         if (balance) counted.push_back(engineId);
-        channels.emplace_back(
-            std::make_unique<SdmaQueue>(static_cast<uint32_t>(hsakmtNode), engineId));
+        auto q = std::make_unique<SdmaQueue>(static_cast<uint32_t>(hsakmtNode), engineId);
+        if (!deviceDoorbellReaches(srcNode, *q)) {
+          const uint32_t even = engineId & ~1u;
+          MORI_APP_WARN(
+              "SDMA: device-rung doorbells of a queue on engine {} of KFD node {} "
+              "ring engine {}; using engine {}",
+              engineId, srcNode, even, even);
+          q.reset();
+          if (balance) {
+            mi308x_engine_use_[srcNode].queues[engineId]--;
+            mi308x_engine_use_[srcNode].queues[even]++;
+            counted.back() = even;
+          }
+          q = std::make_unique<SdmaQueue>(static_cast<uint32_t>(hsakmtNode), even);
+        }
+        channels.emplace_back(std::move(q));
       }
     } catch (const std::exception& e) {
       for (uint32_t id : counted) mi308x_engine_use_[srcNode].queues[id]--;
@@ -586,6 +624,12 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
 // once per (src, dst) so every queue of a link shares one engine: AsyncLL uses
 // one queue per peer per op, and a link whose queues were spread over engines
 // measured 28-53% slower.
+// MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host copies.
+std::vector<uint32_t> AnvilLib::mi308xXgmiEngines(int srcNode) {
+  if (oddEnginesForDeviceQueues(srcNode)) return {2u, 3u, 4u, 5u, 6u, 7u};
+  return {2u, 4u, 6u};
+}
+
 uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
                                     const std::vector<uint32_t>& recommended) {
   const auto key = std::make_pair(srcNode, dstNode);
@@ -597,8 +641,9 @@ uint32_t AnvilLib::mi308xLinkEngine(int srcNode, int dstNode,
         std::find(recommended.begin(), recommended.end(), e) == recommended.end();
     return std::make_tuple(use.links[e], notRecommended, e);
   };
-  uint32_t best = kMi308xXgmiEngines[0];
-  for (uint32_t e : kMi308xXgmiEngines) {
+  const std::vector<uint32_t> xgmi = mi308xXgmiEngines(srcNode);
+  uint32_t best = xgmi.front();
+  for (uint32_t e : xgmi) {
     if (rank(e) < rank(best)) best = e;
   }
   use.links[best]++;
@@ -613,7 +658,8 @@ uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
   auto& use = mi308x_engine_use_[srcNode];
   uint32_t e = mi308x_link_engine_.at(std::make_pair(srcNode, dstNode));
   if (use.queues[e] >= kMi308xQueuesPerEngine) {
-    e = *std::min_element(kMi308xXgmiEngines.begin(), kMi308xXgmiEngines.end(),
+    const std::vector<uint32_t> xgmi = mi308xXgmiEngines(srcNode);
+    e = *std::min_element(xgmi.begin(), xgmi.end(),
                           [&](uint32_t a, uint32_t b) { return use.queues[a] < use.queues[b]; });
     if (use.queues[e] >= kMi308xQueuesPerEngine) {
       throw std::runtime_error("SDMA: KFD node " + std::to_string(srcNode) + " has all " +
@@ -664,6 +710,114 @@ std::unique_ptr<SdmaGatedQueue> AnvilLib::createGatedQueue(int srcNode, int dstN
     MORI_APP_ERROR("SDMA: no gated queue for KFD nodes {} -> {}: {}", srcNode, dstNode, e.what());
     return nullptr;
   }
+}
+
+bool AnvilLib::deviceQueuesUseOddEngines(int node) {
+  init();
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  return oddEnginesForDeviceQueues(node);
+}
+
+bool AnvilLib::oddEnginesForDeviceQueues(int node) {
+  auto it = doorbell_layout_.find(node);
+  if (it != doorbell_layout_.end()) return it->second.oddEngines;
+  DoorbellLayout layout;
+  switch (oddEnginesMode()) {
+    case OddEnginesMode::kOn:
+      layout.oddEngines = true;
+      MORI_APP_WARN(
+          "SDMA: MORI_SDMA_ODD_ENGINES=on: device-rung queues on KFD node {} may use odd "
+          "engines, which hang on amdgpu drivers without amdkfd commit f145d5b3f740",
+          node);
+      break;
+    case OddEnginesMode::kOff:
+      layout.oddEngines = false;
+      break;
+    case OddEnginesMode::kAuto:
+      if (needsShaderDoorbellFix(node)) {
+        probeShaderDoorbellFix(node, layout);
+      } else {
+        layout.oddEngines = true;
+      }
+      break;
+  }
+  doorbell_layout_[node] = layout;
+  return layout.oddEngines;
+}
+
+// Throwaway gated queues show where amdkfd puts doorbells: a queue in the first two
+// slots of an odd engine's range means the fix is missing, one past its first four
+// means it is there. Queues 0/1, 2/3, ... share a slot, so a fixed kernel needs a fifth
+// queue on an idle engine to show it. Anything else counts as missing.
+void AnvilLib::probeShaderDoorbellFix(int node, DoorbellLayout& layout) {
+  layout.oddEngines = false;
+  const char* verdict = "could not tell whether this amdgpu driver has";
+  const int hsakmtNode = hsakmtNodeOf(node);
+  const uint32_t nGeneral = static_cast<uint32_t>(kfdNodeProperty(node, "num_sdma_engines"));
+  const uint32_t nAll =
+      nGeneral + static_cast<uint32_t>(kfdNodeProperty(node, "num_sdma_xgmi_engines"));
+  // Even engines and their odd siblings, xGMI first, until one pair decides (an engine
+  // whose queue slots are taken cannot).
+  std::vector<uint32_t> evens;
+  for (uint32_t e = (nGeneral + 1u) & ~1u; e + 1 < nAll; e += 2) evens.push_back(e);
+  for (uint32_t e = 0; e + 1 < nGeneral; e += 2) evens.push_back(e);
+  bool decided = hsakmtNode < 0;
+  for (uint32_t even : evens) {
+    if (decided) break;
+    auto ref = SdmaGatedQueue::Create(static_cast<uint32_t>(hsakmtNode), even, 4096, nullptr);
+    if (!ref) continue;
+    const uint32_t evenIndex = DoorbellIndex(ref->hostHandle().doorbell);
+    std::vector<std::unique_ptr<SdmaGatedQueue>> probes;
+    for (int i = 0; i < 6 && !decided; i++) {
+      auto q = SdmaGatedQueue::Create(static_cast<uint32_t>(hsakmtNode), even + 1, 4096, nullptr);
+      if (!q) break;
+      switch (ClassifyOddEngineDoorbell(even, evenIndex, even + 1,
+                                        DoorbellIndex(q->hostHandle().doorbell))) {
+        case OddEngineDoorbell::kMisrouted:
+          verdict = "this amdgpu driver lacks";
+          decided = true;
+          break;
+        case OddEngineDoorbell::kFixed:
+          layout.oddEngines = true;
+          decided = true;
+          break;
+        case OddEngineDoorbell::kUnknown:
+          verdict = "unexpected SDMA doorbell layout; could not tell whether this driver has";
+          decided = true;
+          break;
+        case OddEngineDoorbell::kRouted:
+          break;
+      }
+      probes.push_back(std::move(q));
+    }
+    if (!layout.haveRef || decided) {
+      layout.haveRef = true;
+      layout.evenEngine = even;
+      layout.evenIndex = evenIndex;
+    }
+  }
+  if (layout.oddEngines) {
+    MORI_APP_INFO(
+        "SDMA: KFD node {}: amdkfd has commit f145d5b3f740; device-rung queues may "
+        "use odd engines",
+        node);
+  } else {
+    MORI_APP_WARN(
+        "SDMA: KFD node {}: {} amdkfd commit f145d5b3f740 (\"drm/amdkfd: align SDMA "
+        "doorbell base for shader doorbell writes\"), so device-rung SDMA queues use "
+        "even engines only (MORI_SDMA_ODD_ENGINES=on overrides)",
+        node, verdict);
+  }
+}
+
+bool AnvilLib::deviceDoorbellReaches(int node, const SdmaQueue& q) {
+  if ((q.engineId_ & 1u) == 0 || oddEnginesMode() == OddEnginesMode::kOn) return true;
+  auto it = doorbell_layout_.find(node);
+  if (it == doorbell_layout_.end() || !it->second.haveRef) return true;
+  const OddEngineDoorbell c =
+      ClassifyOddEngineDoorbell(it->second.evenEngine, it->second.evenIndex, q.engineId_,
+                                DoorbellIndex(q.queue_.Queue_DoorBell_aql));
+  return c == OddEngineDoorbell::kRouted || c == OddEngineDoorbell::kFixed;
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
