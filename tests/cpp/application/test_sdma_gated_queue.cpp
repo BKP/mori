@@ -111,9 +111,19 @@ TEST(SdmaGatedQueue, CreateIdle) {
 TEST(SdmaGatedQueue, RejectsBadArguments) {
   if (DeviceCount() < 1) GTEST_SKIP() << "no GPU";
   const int n = Node(0);
-  EXPECT_EQ(anvil::anvil.createGatedQueue(n, n, 2048), nullptr);
-  EXPECT_EQ(anvil::anvil.createGatedQueue(n, n, 12288), nullptr);
-  EXPECT_NE(anvil::anvil.createGatedQueue(n, n, 4096), nullptr);
+  EXPECT_EQ(anvil::anvil.createGatedQueue(n, n, 0, 2048), nullptr);
+  EXPECT_EQ(anvil::anvil.createGatedQueue(n, n, 0, 12288), nullptr);
+  EXPECT_EQ(anvil::anvil.createGatedQueue(n, n, -1), nullptr);
+  EXPECT_NE(anvil::anvil.createGatedQueue(n, n, 0, 4096), nullptr);
+}
+
+TEST(SdmaGatedQueue, EngineOffsetMovesTheQueue) {
+  if (DeviceCount() < 2) GTEST_SKIP() << "needs two GPUs";
+  auto q0 = anvil::anvil.createGatedQueue(Node(0), Node(1), 0);
+  ASSERT_NE(q0, nullptr);
+  auto q1 = anvil::anvil.createGatedQueue(Node(0), Node(1), 1);
+  if (q1 == nullptr) GTEST_SKIP() << "offset 1 refused here (e.g. MI308X)";
+  EXPECT_NE(q1->hostHandle().engineId, q0->hostHandle().engineId);
 }
 
 TEST(SdmaGatedQueue, HostDrivenCopy) {

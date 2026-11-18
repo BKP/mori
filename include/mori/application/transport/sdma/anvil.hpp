@@ -127,7 +127,7 @@ class AnvilLib {
   // kernel trips the gate. Anything else on the queue would wait behind it, or
   // deadlock if the gate's kernel needs it, so this queue is never one of the
   // pair's shared channels and has no device handle. Owned by the caller.
-  std::unique_ptr<SdmaGatedQueue> createGatedQueue(int srcNode, int dstNode,
+  std::unique_ptr<SdmaGatedQueue> createGatedQueue(int srcNode, int dstNode, int engineOffset = 0,
                                                    uint64_t ringBytes = SDMA_QUEUE_SIZE);
 
   // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
