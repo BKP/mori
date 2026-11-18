@@ -129,7 +129,10 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
-    if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
+    if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) {
+      MORI_SHMEM_ERROR("no SDMA queues to local peer {}; its ccoSdma puts move no bytes", lsa);
+      continue;
+    }
     int dstNode = comm->ctx->KfdNodeId(pe);
     for (int q = 0; q < comm->sdmaNumQueue; q++) {
       // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque

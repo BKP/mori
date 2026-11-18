@@ -138,4 +138,22 @@ TEST(SdmaGatedQueue, HostDrivenCopy) {
   EXPECT_EQ(std::memcmp(got.data(), want.data(), kBytes), 0);
 }
 
+TEST(SdmaGatedQueue, ConnectFailsInsteadOfExiting) {
+  if (DeviceCount() < 2) GTEST_SKIP() << "needs two GPUs";
+  const int n = Node(0), p = Node(1);
+  std::vector<std::unique_ptr<anvil::SdmaGatedQueue>> held;
+  while (held.size() < 64) {
+    auto q = anvil::anvil.createGatedQueue(n, p);
+    if (q == nullptr) break;
+    held.push_back(std::move(q));
+  }
+  ASSERT_FALSE(held.empty());
+  if (anvil::anvil.connect(n, p, 1))
+    GTEST_SKIP() << "connect() used another engine (MI308X balances peer links)";
+  EXPECT_EQ(anvil::anvil.getSdmaQueue(n, p, 0), nullptr);
+  held.pop_back();
+  EXPECT_TRUE(anvil::anvil.connect(n, p, 1));
+  EXPECT_NE(anvil::anvil.getSdmaQueue(n, p, 0), nullptr);
+}
+
 }  // namespace

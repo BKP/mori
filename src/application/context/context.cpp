@@ -73,18 +73,15 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
 void Context::BuildInitialEndpoints() {
   if (initialEndpointsBuilt) return;
 
-  // (A) Apply default policy: cap + env vars → one TransportType per peer.
+  // (A) Materialize SDMA queues first: a peer whose queues cannot be made loses
+  //     canSDMA, so the policy below does not pick SDMA for it.
+  if (IsSdmaEnabled()) EnsureSdmaTransport();
+
+  // (B) Apply default policy: cap + env vars → one TransportType per peer.
   transportTypes.clear();
   transportTypes.reserve(WorldSize());
-  bool anyNeedsSdma = false;
-  for (int i = 0; i < WorldSize(); i++) {
-    TransportType t = DefaultPolicyResolve(peerCaps[i], /*isSelf=*/i == LocalRank());
-    transportTypes.push_back(t);
-    if (t == TransportType::SDMA) anyNeedsSdma = true;
-  }
-
-  // (B) Materialize SDMA queues if any peer resolved to SDMA.
-  if (anyNeedsSdma) EnsureSdmaTransport();
+  for (int i = 0; i < WorldSize(); i++)
+    transportTypes.push_back(DefaultPolicyResolve(peerCaps[i], /*isSelf=*/i == LocalRank()));
 
   // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
   //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers get stubs.
@@ -490,11 +487,13 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
     if (peerNode < 0 || localNode < 0) {
       MORI_APP_WARN("Local or peer {} KFD node id unresolved for rank {}", i, LocalRank());
       peerCaps[i].canSDMA = false;
-      transportTypes[i] =
-          (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P : TransportType::RDMA;
       continue;
     }
-    anvil::anvil.connect(localNode, peerNode, sdmaNumChannels);
+    if (!anvil::anvil.connect(localNode, peerNode, sdmaNumChannels)) {
+      MORI_APP_ERROR("No SDMA queues to rank {} (KFD node {} -> {})", i, localNode, peerNode);
+      if (IsP2PDisabled()) exit(EXIT_FAILURE);  // P2P is the only other same-host transport
+      peerCaps[i].canSDMA = false;
+    }
   }
   sdmaChannels_ = sdmaNumChannels;
   sdmaSetupDone = true;

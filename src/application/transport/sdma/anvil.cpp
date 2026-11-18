@@ -227,15 +227,6 @@ int hsakmtNodeOf(int node) {
   return -1;
 }
 
-uint32_t hsakmtNodeForKfdNode(int node) {
-  const int n = hsakmtNodeOf(node);
-  if (n >= 0) return static_cast<uint32_t>(n);
-  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
-  // and blame the network, and cco cannot propagate one into Python.
-  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
-  exit(EXIT_FAILURE);
-}
-
 // HDP_MEM_FLUSH_CNTL of the GPU at a KFD node, matched to its HSA agent by gpu_id.
 // Null if the agent is not found or the GPU exposes no register.
 volatile uint32_t* hdpFlushRegister(int node) {
@@ -274,18 +265,27 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
-                       "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
+  HSAKMT_STATUS st = hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_);
+  if (st != HSAKMT_STATUS_SUCCESS)
+    throw std::runtime_error("ring allocation failed (" + std::to_string(st) + ")");
+  st = hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    (void)hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE);
+    throw std::runtime_error("mapping the ring failed (" + std::to_string(st) + ")");
+  }
 
   // Create SDMA Queue
   // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+  st = hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                            engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    (void)hsaKmtUnmapMemoryToGPU(queueBuffer_);
+    (void)hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE);
+    throw std::runtime_error("no queue on engine " + std::to_string(engineId) + " (" +
+                             std::to_string(st) + "); its slots may be taken");
+  }
 
   // Populate Device Handle
   // TODO uncached
@@ -528,7 +528,13 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // Spread the channels across the engines recommended for this peer link. On
   // MI350 the mask typically reports 2 engines per peer; on platforms with a
   // single recommended engine all channels share it.
-  std::vector<uint32_t> engines = linkEngines(srcNode, dstNode);
+  std::vector<uint32_t> engines;
+  try {
+    engines = linkEngines(srcNode, dstNode);
+  } catch (const std::exception& e) {
+    MORI_APP_ERROR("SDMA: no engine for KFD nodes {} -> {}: {}", srcNode, dstNode, e.what());
+    return false;
+  }
   const bool mi308x = isMi308x(srcNode);
   const int numEngines = static_cast<int>(engines.size());
 
@@ -540,16 +546,34 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   if (static_cast<int>(channels.size()) < numChannels) {
-    const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+    const int hsakmtNode = hsakmtNodeOf(srcNode);
+    if (hsakmtNode < 0) {
+      MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", srcNode);
+      return false;
+    }
     // linkEngines()' fold puts several of a MI308X GPU's peer links on one engine
     // (masks 0x40 and 0x80 both land on 6), serialising its copies to those
     // peers, so its peer links are balanced over the xGMI engines instead.
     const bool balance = mi308x && srcNode != dstNode;
     if (balance) mi308xLinkEngine(srcNode, dstNode, engines);
-    for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
-      const uint32_t engineId =
-          balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
-      channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+    // On failure, drop the queues made here and give back their MI308X counts,
+    // so the pair keeps what it had and the caller can fall back.
+    const size_t had = channels.size();
+    std::vector<uint32_t> counted;
+    try {
+      for (int c = static_cast<int>(had); c < numChannels; ++c) {
+        const uint32_t engineId =
+            balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
+        if (balance) counted.push_back(engineId);
+        channels.emplace_back(
+            std::make_unique<SdmaQueue>(static_cast<uint32_t>(hsakmtNode), engineId));
+      }
+    } catch (const std::exception& e) {
+      for (uint32_t id : counted) mi308x_engine_use_[srcNode].queues[id]--;
+      channels.resize(had);
+      MORI_APP_ERROR("SDMA: {} channels for KFD nodes {} -> {} failed: {}", numChannels, srcNode,
+                     dstNode, e.what());
+      return false;
     }
   }
   return true;

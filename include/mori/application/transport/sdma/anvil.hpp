@@ -47,7 +47,8 @@ namespace anvil {
 
 class SdmaQueue {
  public:
-  // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()).
+  // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()). Throws
+  // std::runtime_error if KFD refuses the ring or the queue; connect() catches it.
   SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId);
   ~SdmaQueue();
 
@@ -115,6 +116,8 @@ class AnvilLib {
   // which GPUs a container exposes. libhsakmt numbers only the nodes this process
   // can open, so anvil reads topology from sysfs and translates the local node
   // only to create its queues. Channels for a pair are shared process-wide.
+  // False, with the pair's existing channels untouched, if a queue cannot be made
+  // (e.g. its engine's KFD queue slots are taken by gated queues).
   bool connect(int srcNode, int dstNode, int numChannels = 1);
 
   // Get the SDMA queue for a given src/dst node pair and channel index.
