@@ -176,6 +176,17 @@ jobs:
               case \"\$out\" in *SKIP*) echo \"\$t SKIPped: SDMA is not active\"; exit 1;; esac; \
             done"
 
+      - name: Run anvil gated-queue test
+        if: contains(fromJSON(inputs.groups), 'cco')
+        run: |
+          # Host-driven SDMA queues. A SKIP means the runner lost GPUs, so it fails
+          # here as in the step above.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            out=\$(timeout 300 ./build/tests/cpp/test_sdma_gated_queue 2>&1) || { echo \"\$out\"; exit 1; }; \
+            echo \"\$out\"; \
+            case \"\$out\" in *SKIPPED*) echo \"test_sdma_gated_queue SKIPped\"; exit 1;; esac"
+
       - name: Run CCO SDMA benchmarks (2 ranks, smoke)
         if: contains(fromJSON(inputs.groups), 'cco')
         run: |

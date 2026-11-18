@@ -213,21 +213,46 @@ std::vector<KfdLink> kfdLinks(int node) {
 
 // libhsakmt numbers only the nodes this process can open, 0..NumNodes-1, so in a
 // container given some of the host's GPUs its ids are not the sysfs ones. Match
-// the GPU by gpu_id.
-uint32_t hsakmtNodeForKfdNode(int node) {
+// the GPU by gpu_id. -1 if no libhsakmt node has it.
+int hsakmtNodeOf(int node) {
   const uint64_t gpuId = kfdGpuId(node);
   HsaSystemProperties sys{};
   if (gpuId != 0 && hsaKmtAcquireSystemProperties(&sys) == HSAKMT_STATUS_SUCCESS) {
     for (uint32_t n = 0; n < sys.NumNodes; ++n) {
       HsaNodeProperties props{};
       if (hsaKmtGetNodeProperties(n, &props) == HSAKMT_STATUS_SUCCESS && props.KFDGpuID == gpuId)
-        return n;
+        return static_cast<int>(n);
     }
   }
+  return -1;
+}
+
+uint32_t hsakmtNodeForKfdNode(int node) {
+  const int n = hsakmtNodeOf(node);
+  if (n >= 0) return static_cast<uint32_t>(n);
   // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
   // and blame the network, and cco cannot propagate one into Python.
   MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
   exit(EXIT_FAILURE);
+}
+
+// HDP_MEM_FLUSH_CNTL of the GPU at a KFD node, matched to its HSA agent by gpu_id.
+// Null if the agent is not found or the GPU exposes no register.
+volatile uint32_t* hdpFlushRegister(int node) {
+  const uint64_t gpuId = kfdGpuId(node);
+  for (const hsa_agent_t& agent : gpuAgents_) {
+    uint32_t uid = 0;
+    if (hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_DRIVER_UID),
+                           &uid) != HSA_STATUS_SUCCESS ||
+        uid != gpuId)
+      continue;
+    hsa_amd_hdp_flush_t hdp{};
+    if (hsa_agent_get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_HDP_FLUSH),
+                           &hdp) != HSA_STATUS_SUCCESS)
+      return nullptr;
+    return hdp.HDP_MEM_FLUSH_CNTL;
+  }
+  return nullptr;
 }
 
 HsaMemFlags ringMemFlags() {
@@ -299,6 +324,61 @@ SdmaQueue::~SdmaQueue() {
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
+
+std::unique_ptr<SdmaGatedQueue> SdmaGatedQueue::Create(uint32_t hsakmtNodeId, uint32_t engineId,
+                                                       uint64_t ringBytes,
+                                                       volatile uint32_t* hdpFlush) {
+  if (ringBytes < 4096 || (ringBytes & (ringBytes - 1)) != 0) {
+    MORI_APP_ERROR("SDMA: gated queue ring of {} bytes is not a power of two >= 4096", ringBytes);
+    return nullptr;
+  }
+  void* ring = nullptr;
+  HsaQueueResource res{};
+  HSAKMT_STATUS st = hsaKmtAllocMemory(hsakmtNodeId, ringBytes, ringMemFlags(), &ring);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: ring allocation of {} bytes failed ({})", ringBytes,
+                   static_cast<int>(st));
+    return nullptr;
+  }
+  st = hsaKmtMapMemoryToGPU(ring, ringBytes, NULL);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: mapping a {}-byte ring failed ({})", ringBytes, static_cast<int>(st));
+    (void)hsaKmtFreeMemory(ring, ringBytes);
+    return nullptr;
+  }
+  st = hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                            engineId, ring, ringBytes, nullptr, &res);
+  if (st != HSAKMT_STATUS_SUCCESS) {
+    MORI_APP_ERROR("SDMA: no queue on engine {} ({}); its slots may be taken", engineId,
+                   static_cast<int>(st));
+    (void)hsaKmtUnmapMemoryToGPU(ring);
+    (void)hsaKmtFreeMemory(ring, ringBytes);
+    return nullptr;
+  }
+  std::unique_ptr<SdmaGatedQueue> q(new SdmaGatedQueue());
+  q->ring_ = ring;
+  q->ringBytes_ = ringBytes;
+  q->engineId_ = engineId;
+  q->hdpFlush_ = hdpFlush;
+  q->queue_ = res;
+  return q;
+}
+
+SdmaGatedQueue::~SdmaGatedQueue() {
+  CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
+  CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(ring_), "Failed");
+  CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(ring_, ringBytes_), "Failed");
+}
+
+SdmaGatedQueueHandle SdmaGatedQueue::hostHandle() const {
+  return SdmaGatedQueueHandle{static_cast<uint32_t*>(ring_),
+                              ringBytes_,
+                              reinterpret_cast<volatile uint64_t*>(queue_.Queue_read_ptr_aql),
+                              reinterpret_cast<volatile uint64_t*>(queue_.Queue_write_ptr_aql),
+                              reinterpret_cast<volatile uint64_t*>(queue_.Queue_DoorBell_aql),
+                              hdpFlush_,
+                              engineId_};
+}
 
 AnvilLib::~AnvilLib() {
   for (auto& p : sdma_channels_) {
@@ -518,6 +598,31 @@ uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
   }
   use.queues[e]++;
   return e;
+}
+
+std::unique_ptr<SdmaGatedQueue> AnvilLib::createGatedQueue(int srcNode, int dstNode,
+                                                           uint64_t ringBytes) {
+  try {
+    init();
+    std::vector<uint32_t> engines;
+    {
+      std::lock_guard<std::mutex> lock(channels_mutex_);  // for linkEngines()
+      engines = linkEngines(srcNode, dstNode);
+    }
+    const uint32_t engineId = engines.front();
+    const int hsakmtNode = hsakmtNodeOf(srcNode);
+    volatile uint32_t* hdpFlush = hdpFlushRegister(srcNode);
+    if (hsakmtNode < 0 || hdpFlush == nullptr) {
+      MORI_APP_ERROR("SDMA: no gated queue on KFD node {}: {}", srcNode,
+                     hsakmtNode < 0 ? "no libhsakmt node has its gpu_id"
+                                    : "the GPU exposes no HDP flush register");
+      return nullptr;
+    }
+    return SdmaGatedQueue::Create(static_cast<uint32_t>(hsakmtNode), engineId, ringBytes, hdpFlush);
+  } catch (const std::exception& e) {
+    MORI_APP_ERROR("SDMA: no gated queue for KFD nodes {} -> {}: {}", srcNode, dstNode, e.what());
+    return nullptr;
+  }
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {

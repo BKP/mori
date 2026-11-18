@@ -61,6 +61,40 @@ class SdmaQueue {
   SdmaQueueDeviceHandle* deviceHandle_;
 };
 
+struct SdmaGatedQueueHandle {
+  uint32_t* ring;
+  uint64_t ringBytes;
+  volatile uint64_t* rptr;
+  volatile uint64_t* wptr;
+  volatile uint64_t* doorbell;
+  // Host ring stores reach the engine only after a write here.
+  volatile uint32_t* hdpFlush;
+  uint32_t engineId;
+};
+
+class SdmaGatedQueue {
+ public:
+  // Drops the work still queued behind a closed gate, so destroy the queue before
+  // freeing memory that work references.
+  ~SdmaGatedQueue();
+  SdmaGatedQueue(const SdmaGatedQueue&) = delete;
+  SdmaGatedQueue& operator=(const SdmaGatedQueue&) = delete;
+
+  SdmaGatedQueueHandle hostHandle() const;
+
+ private:
+  friend class AnvilLib;
+  SdmaGatedQueue() = default;
+  static std::unique_ptr<SdmaGatedQueue> Create(uint32_t hsakmtNodeId, uint32_t engineId,
+                                                uint64_t ringBytes, volatile uint32_t* hdpFlush);
+
+  void* ring_{nullptr};
+  uint64_t ringBytes_{0};
+  HsaQueueResource queue_{};
+  volatile uint32_t* hdpFlush_{nullptr};
+  uint32_t engineId_{0};
+};
+
 class AnvilLib {
  private:
   // Make constructor private
@@ -85,6 +119,13 @@ class AnvilLib {
 
   // Get the SDMA queue for a given src/dst node pair and channel index.
   SdmaQueue* getSdmaQueue(int srcNode, int dstNode, int channelIdx = 0);
+
+  // A gated queue holds work behind gates: the engine parks at each POLL until a
+  // kernel trips the gate. Anything else on the queue would wait behind it, or
+  // deadlock if the gate's kernel needs it, so this queue is never one of the
+  // pair's shared channels and has no device handle. Owned by the caller.
+  std::unique_ptr<SdmaGatedQueue> createGatedQueue(int srcNode, int dstNode,
+                                                   uint64_t ringBytes = SDMA_QUEUE_SIZE);
 
   // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
   // (e.g. the examples) that only have HIP device ids; multi-process collectives
