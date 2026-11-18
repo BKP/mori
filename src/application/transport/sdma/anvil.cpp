@@ -596,14 +596,34 @@ uint32_t AnvilLib::mi308xQueueEngine(int srcNode, int dstNode) {
 }
 
 std::unique_ptr<SdmaGatedQueue> AnvilLib::createGatedQueue(int srcNode, int dstNode,
-                                                           uint64_t ringBytes) {
+                                                           int engineOffset, uint64_t ringBytes) {
   init();
   std::vector<uint32_t> engines;
   {
     std::lock_guard<std::mutex> lock(channels_mutex_);  // for linkEngines()
     engines = linkEngines(srcNode, dstNode);
   }
-  const uint32_t engineId = engines.front();
+  uint32_t engineId = engines.front();
+  if (engineOffset != 0) {
+    // Stay within the engine's class: general engines (0..nGeneral-1, shared with the
+    // runtime's own copy queues) or xGMI engines (nGeneral..nGeneral+nXgmi-1).
+    const uint64_t nGeneral = kfdNodeProperty(srcNode, "num_sdma_engines");
+    const uint64_t nXgmi = kfdNodeProperty(srcNode, "num_sdma_xgmi_engines");
+    const bool xgmi = engineId >= nGeneral;
+    const uint64_t first = xgmi ? nGeneral : 0;
+    const uint64_t count = xgmi ? nXgmi : nGeneral;
+    if (engineOffset < 0 || count == 0 || engineId >= nGeneral + nXgmi) {
+      MORI_APP_ERROR("SDMA: engine offset {} invalid for engine {} of node {}", engineOffset,
+                     engineId, srcNode);
+      return nullptr;
+    }
+    engineId = static_cast<uint32_t>(first + (engineId - first + engineOffset) % count);
+    // See linkEngines(): an odd engine on MI308X is fused off and hangs.
+    if (isMi308x(srcNode) && (engineId & 1u)) {
+      MORI_APP_ERROR("SDMA: engine {} does not exist on MI308X", engineId);
+      return nullptr;
+    }
+  }
   return SdmaGatedQueue::Create(hsakmtNodeForKfdNode(srcNode), engineId, ringBytes,
                                 hdpFlushRegister(srcNode));
 }
